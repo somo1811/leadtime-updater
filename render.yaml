@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: leadtime-updater
+    runtime: docker
+    region: singapore
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_PASSWORD
+        sync: false
+      - key: SP_CLIENT_ID
+        sync: false
+      - key: SP_CLIENT_SECRET
+        sync: false
+      - key: SP_REFRESH_TOKEN
+        sync: false
+      - key: SP_SELLER_ID
+        sync: false
