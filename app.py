@@ -310,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt, *args):
-        if "/api/status" not in (args[0] if args else ""):
+        if "/api/status" not in str(args[0] if args else ""):
             sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
 
     def send(self, code, body=b"", ctype="text/html; charset=utf-8", extra=None):
