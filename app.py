@@ -23,6 +23,7 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import sys
 import threading
@@ -41,6 +42,10 @@ CHANNEL_HEADERS = ["fulfillment-channel", "フルフィルメント・チャン�
 INTERVAL = 0.25          # 1件ごとの待ち時間(秒)。API上限は毎秒5件
 SESSION_HOURS = 12
 DEMO = os.environ.get("DEMO_MODE") == "1"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") else os.path.join(_HERE, "data"))
+RUNS_DIR = os.path.join(DATA_DIR, "runs")
+KEEP_RUNS = 200
 
 
 # ───────────────────────── SP-API ─────────────────────────
@@ -128,31 +133,42 @@ class SpApi:
             raw = gzip.decompress(raw)
         return parse_listing_report(raw)
 
-    def patch_lead_time(self, sku, days, preview=False):
-        query = {"marketplaceIds": self.marketplace, "issueLocale": "ja_JP"}
-        body = {"productType": "PRODUCT", "patches": [{
-            "op": "merge",                       # 在庫数など他の項目は変更しない
-            "path": "/attributes/fulfillment_availability",
-            "value": [{"fulfillment_channel_code": "DEFAULT",
-                       "lead_time_to_ship_max_days": days}]}]}
-        path = f"/listings/2021-08-01/items/{self.seller_id}/{urllib.parse.quote(sku, safe='')}"
-        return self.call("PATCH", path, query, body)
+    def _item_path(self, sku):
+        return f"/listings/2021-08-01/items/{self.seller_id}/{urllib.parse.quote(sku, safe='')}"
 
+    def fetch_state(self, sku):
+        """現在の在庫数とリードタイムを読み取る(変更はしない)。"""
+        item = self.call("GET", self._item_path(sku), {
+            "marketplaceIds": self.marketplace, "includedData": "attributes"})
+        for x in item.get("attributes", {}).get("fulfillment_availability", []):
+            if x.get("fulfillment_channel_code", "DEFAULT") == "DEFAULT":
+                return {"qty": x.get("quantity"), "lead": x.get("lead_time_to_ship_max_days")}
+        return {"qty": None, "lead": None}
 
     def check_item(self, sku):
-        """変更せず、SKUが存在するかと現在の在庫数・リードタイムを読み取る。"""
-        path = f"/listings/2021-08-01/items/{self.seller_id}/{urllib.parse.quote(sku, safe='')}"
-        item = self.call("GET", path, {"marketplaceIds": self.marketplace,
-                                       "includedData": "summaries,attributes"})
-        fa = item.get("attributes", {}).get("fulfillment_availability", [])
-        if not fa:
-            return {"status": "VALID", "issues": [], "info": "現在: 設定情報なし(標準のリードタイム)"}
-        parts = []
-        for x in fa:
-            lt = x.get("lead_time_to_ship_max_days")
-            parts.append(f"在庫 {x.get('quantity', '-')} / リードタイム "
-                         + (f"{lt}日" if lt is not None else "未設定(標準)"))
-        return {"status": "VALID", "issues": [], "info": "現在: " + "、".join(parts)}
+        st = self.fetch_state(sku)
+        lt = st["lead"]
+        info = (f"現在: 在庫 {st['qty'] if st['qty'] is not None else '-'} / リードタイム "
+                + (f"{lt}日" if lt is not None else "未設定(標準)"))
+        return {"status": "VALID", "issues": [], "before": lt, "info": info}
+
+    def patch_lead_time(self, sku, days):
+        # Amazonは在庫数(quantity)を省いた更新を受け付けないため、
+        # 直前に読み取った現在の在庫数をそのまま添えて送る。
+        st = self.fetch_state(sku)
+        if st["qty"] is None:
+            return {"status": "INVALID", "before": st["lead"], "issues": [{
+                "severity": "ERROR", "message": "現在の在庫数を取得できなかったため、更新しませんでした。"}]}
+        body = {"productType": "PRODUCT", "patches": [{
+            "op": "replace",
+            "path": "/attributes/fulfillment_availability",
+            "value": [{"fulfillment_channel_code": "DEFAULT",
+                       "quantity": st["qty"],
+                       "lead_time_to_ship_max_days": days}]}]}
+        res = self.call("PATCH", self._item_path(sku),
+                        {"marketplaceIds": self.marketplace, "issueLocale": "ja_JP"}, body)
+        res["before"] = st["lead"]
+        return res
 
 
 class DemoApi:
@@ -164,13 +180,78 @@ class DemoApi:
     def check_item(self, sku):
         if sku.endswith("7"):
             raise ApiError(404, "デモ用: SKUが見つかりません")
-        return {"status": "VALID", "issues": [], "info": "現在: 在庫 5 / リードタイム 2日"}
+        return {"status": "VALID", "issues": [], "before": 2, "info": "現在: 在庫 5 / リードタイム 2日"}
 
-    def patch_lead_time(self, sku, days, preview):
+    def patch_lead_time(self, sku, days):
         if sku.endswith("7"):
-            return {"status": "INVALID", "issues": [
+            return {"status": "INVALID", "before": 2, "issues": [
                 {"severity": "ERROR", "message": "デモ用のエラーです"}]}
-        return {"status": "VALID" if preview else "ACCEPTED", "issues": []}
+        return {"status": "ACCEPTED", "before": 2, "issues": []}
+
+
+# ───────────────────────── 履歴の保存 ─────────────────────────
+def save_run(final):
+    """実行ごとの結果をファイルに残す。保存に失敗しても処理自体は止めない。"""
+    try:
+        with LOCK:
+            j = dict(JOB)
+            rows = list(RESULTS)
+        if not rows:
+            return
+        rid = time.strftime("%Y%m%d-%H%M%S", time.gmtime(j.get("started") or time.time()))
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["SKU", "変更前の日数", "設定した日数", "結果", "内容"])
+        w.writerows(rows)
+        summary = {"id": rid, "started": j.get("started"), "finished": time.time(),
+                   "mode": "check" if j.get("dry_run") else "update", "days": j.get("days"),
+                   "test_sku": j.get("test_sku") or "", "total": j.get("total", 0),
+                   "done": j.get("done", 0), "ok": j.get("ok", 0), "ng": j.get("ng", 0),
+                   "status": final}
+        for name, text in ((rid + ".csv", "\ufeff" + buf.getvalue()),
+                           (rid + ".json", json.dumps(summary, ensure_ascii=False))):
+            tmp = os.path.join(RUNS_DIR, name + ".tmp")
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            os.replace(tmp, os.path.join(RUNS_DIR, name))
+        ids = sorted(f[:-5] for f in os.listdir(RUNS_DIR) if f.endswith(".json"))
+        for old in ids[:-KEEP_RUNS]:
+            for ext in (".json", ".csv"):
+                try:
+                    os.remove(os.path.join(RUNS_DIR, old + ext))
+                except OSError:
+                    pass
+    except Exception as e:
+        sys.stderr.write(f"履歴の保存に失敗しました: {e}\n")
+
+
+def list_runs(limit=50):
+    runs = []
+    try:
+        names = sorted((f for f in os.listdir(RUNS_DIR) if f.endswith(".json")), reverse=True)
+    except OSError:
+        return runs
+    for name in names[:limit]:
+        try:
+            with open(os.path.join(RUNS_DIR, name), encoding="utf-8") as f:
+                runs.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    return runs
+
+
+def drop_privileges():
+    """rootで起動した場合、保存先の所有者を変えたうえで一般ユーザーに切り替える。"""
+    if hasattr(os, "getuid") and os.getuid() == 0:
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        for root, _dirs, files in os.walk(DATA_DIR):
+            os.chown(root, 65534, 65534)
+            for f in files:
+                os.chown(os.path.join(root, f), 65534, 65534)
+        os.setgroups([])
+        os.setgid(65534)
+        os.setuid(65534)
 
 
 def parse_listing_report(raw):
@@ -249,12 +330,15 @@ def update():
     days, dry = JOB["days"], JOB["dry_run"]
     ok = ng = 0
     failures, samples = [], []
+    final = "done"
     try:
         for n, sku in enumerate(list(SKUS), 1):
             if CANCEL.is_set():
                 raise Cancelled()
+            before, res = None, {}
             try:
                 res = API.check_item(sku) if dry else API.patch_lead_time(sku, days)
+                before = res.get("before")
                 status = res.get("status", "?")
                 issues = " / ".join(f"[{i.get('severity')}] {i.get('message')}"
                                     for i in res.get("issues", []))
@@ -268,16 +352,21 @@ def update():
                 issues = res.get("info", "")
                 if len(samples) < 5:
                     samples.append({"sku": sku, "info": issues})
-            RESULTS.append((sku, days, status, issues))
+            shown_before = ("未設定" if before is None else before) if good else ""
+            RESULTS.append((sku, shown_before, "" if dry else days, status, issues))
             if not good and len(failures) < 200:
                 failures.append({"sku": sku, "status": status, "issues": issues[:300]})
             set_job(done=n, ok=ok, ng=ng, failures=failures, samples=samples)
             CANCEL.wait(INTERVAL)
         set_job(phase="done", finished=time.time())
     except Cancelled:
+        final = "cancelled"
         set_job(phase="cancelled", message=f"中止しました。{ok}件は処理済みです。")
     except Exception as e:
+        final = "error"
         set_job(phase="error", message=explain(e))
+    finally:
+        save_run(final)
 
 
 def start(days, dry_run, test_sku):
@@ -285,7 +374,7 @@ def start(days, dry_run, test_sku):
         if JOB["phase"] in ("report", "confirm", "updating"):
             return False
         JOB.clear()
-        JOB.update(phase="report", days=days, dry_run=dry_run, test_sku=test_sku,
+        JOB.update(phase="report", started=time.time(), days=days, dry_run=dry_run, test_sku=test_sku,
                    total=0, done=0, ok=0, ng=0, failures=[], samples=[], message="")
         SKUS.clear()
         RESULTS.clear()
@@ -376,10 +465,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             with LOCK:
                 return self.json(dict(JOB, demo=DEMO))
+        if path == "/api/history":
+            return self.json({"runs": list_runs(), "persistent": os.path.ismount(DATA_DIR)})
+        hm = re.fullmatch(r"/api/history/(\d{8}-\d{6})\.csv", path)
+        if hm:
+            try:
+                with open(os.path.join(RUNS_DIR, hm.group(1) + ".csv"), "rb") as f:
+                    data = f.read()
+            except OSError:
+                return self.send(404, "Not Found", "text/plain")
+            return self.send(200, data, "text/csv; charset=utf-8", {
+                "Content-Disposition": f'attachment; filename="leadtime_{hm.group(1)}.csv"'})
         if path == "/api/result.csv":
             buf = io.StringIO()
             w = csv.writer(buf)
-            w.writerow(["sku", "days", "status", "issues"])
+            w.writerow(["SKU", "変更前の日数", "設定した日数", "結果", "内容"])
             w.writerows(list(RESULTS))
             return self.send(200, "﻿" + buf.getvalue(), "text/csv; charset=utf-8",
                              {"Content-Disposition": 'attachment; filename="leadtime_result.csv"'})
@@ -497,7 +597,7 @@ PAGE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <form class="card" id="form">
  <div class="field"><label for="days">リードタイム</label>
   <div class="days"><input id="days" type="number" min="1" max="30" value="3" required inputmode="numeric"><span>日</span></div>
-  <p class="hint">1〜30日。在庫数や価格は変更しません。</p></div>
+  <p class="hint">1〜30日。在庫数は現在の値をそのまま送ります。価格には触れません。</p></div>
  <div class="field"><label for="sku">1商品だけで試す(任意)</label>
   <input id="sku" type="text" placeholder="SKUを入力" autocomplete="off">
   <p class="hint">入力すると、そのSKUだけを更新します。空欄なら全商品が対象です。</p></div>
@@ -518,6 +618,13 @@ PAGE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
  <div id="samples" class="nums" hidden style="margin-top:12px;word-break:break-all"></div>
  <div id="fails" hidden><table><thead><tr><th>SKU</th><th>結果</th><th>内容</th></tr></thead><tbody id="rows"></tbody></table></div>
 </div>
+
+<div class="card" id="history">
+ <p class="big">履歴</p>
+ <p class="nums" id="hnote"></p>
+ <p class="nums" id="hempty" hidden>まだ履歴はありません。</p>
+ <table id="htable" hidden><thead><tr><th>日時</th><th>内容</th><th>結果</th><th></th></tr></thead><tbody id="hrows"></tbody></table>
+</div>
 </main><script>
 const $=id=>document.getElementById(id);
 const api=(path,body)=>fetch(path,{method:body===undefined?'GET':'POST',
@@ -525,7 +632,7 @@ const api=(path,body)=>fetch(path,{method:body===undefined?'GET':'POST',
   body:body===undefined?undefined:JSON.stringify(body)}).then(async r=>{
     if(r.status===401){location.reload();throw new Error('login')}
     const j=await r.json();if(!r.ok)throw new Error(j.error||'エラーが発生しました');return j});
-let timer=null;
+let timer=null, wasBusy=false;
 const active=p=>['report','confirm','updating'].includes(p);
 function render(s){
   $('demo').hidden=!s.demo;
@@ -533,6 +640,7 @@ function render(s){
   $('go').disabled=busy; $('days').disabled=busy; $('sku').disabled=busy; $('dry').disabled=busy;
   $('panel').hidden=p==='idle';
   if(p==='idle')return;
+  if(wasBusy&&!busy)loadHistory(); wasBusy=busy;
   const what=s.dry_run?'確認':'更新';
   const t={report:'対象の商品を調べています…',
     confirm:`出品者出荷 ${s.total} 件を ${s.days} 日に${what}します`,
@@ -570,7 +678,24 @@ $('form').addEventListener('submit',e=>{e.preventDefault();$('formerr').textCont
 $('confirm').addEventListener('click',()=>api('/api/confirm',{}).then(poll).catch(err=>{$('msg').textContent=err.message}));
 $('cancel').addEventListener('click',()=>api('/api/cancel',{}).then(poll));
 $('logout').addEventListener('click',()=>api('/logout',{}).finally(()=>location.reload()));
-poll();
+function loadHistory(){
+  api('/api/history').then(h=>{
+    $('hnote').textContent=h.persistent?'':'履歴は一時的に保存されています。サービスの再起動や再デプロイで消えます。残すには、RenderでDiskを追加してください。';
+    const runs=h.runs||[]; $('hempty').hidden=runs.length>0; $('htable').hidden=!runs.length;
+    const rows=$('hrows'); rows.textContent='';
+    for(const r of runs){
+      const tr=document.createElement('tr');
+      const when=new Date((r.started||0)*1000).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo',year:'numeric',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      const scope=r.test_sku?`(SKU: ${r.test_sku})`:'(全商品)';
+      const what=r.mode==='update'?`${r.days}日に更新${scope}`:`現在の設定を確認${scope}`;
+      let res=`成功 ${r.ok}・失敗 ${r.ng}`;
+      if(r.status==='cancelled')res+='・中止'; if(r.status==='error')res+='・エラー';
+      for(const v of [when,what,res]){const td=document.createElement('td');td.textContent=v;tr.appendChild(td)}
+      const td=document.createElement('td');const a=document.createElement('a');
+      a.href='/api/history/'+r.id+'.csv';a.textContent='CSV';td.appendChild(a);tr.appendChild(td);rows.appendChild(tr)}
+  }).catch(()=>{});
+}
+poll(); loadHistory();
 </script></body></html>"""
 
 
@@ -586,6 +711,7 @@ def main():
         if missing:
             sys.exit("次の環境変数が未設定です: " + ", ".join(missing))
         API = SpApi()
+    drop_privileges()
     port = int(os.environ.get("PORT", "8080"))
     print(f"起動しました: ポート {port}" + (" (デモモード)" if DEMO else ""), flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

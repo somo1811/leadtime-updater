@@ -3,7 +3,12 @@ services:
     name: leadtime-updater
     runtime: docker
     region: singapore
+    plan: starter            # 履歴を残すにはDiskが必要で、Diskは有料プランのみ
     healthCheckPath: /healthz
+    disk:
+      name: leadtime-data
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: APP_PASSWORD
         sync: false
