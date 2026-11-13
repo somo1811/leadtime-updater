@@ -128,10 +128,8 @@ class SpApi:
             raw = gzip.decompress(raw)
         return parse_listing_report(raw)
 
-    def patch_lead_time(self, sku, days, preview):
+    def patch_lead_time(self, sku, days, preview=False):
         query = {"marketplaceIds": self.marketplace, "issueLocale": "ja_JP"}
-        if preview:
-            query["mode"] = "VALIDATION_PREVIEW"
         body = {"productType": "PRODUCT", "patches": [{
             "op": "merge",                       # 在庫数など他の項目は変更しない
             "path": "/attributes/fulfillment_availability",
@@ -141,11 +139,32 @@ class SpApi:
         return self.call("PATCH", path, query, body)
 
 
+    def check_item(self, sku):
+        """変更せず、SKUが存在するかと現在の在庫数・リードタイムを読み取る。"""
+        path = f"/listings/2021-08-01/items/{self.seller_id}/{urllib.parse.quote(sku, safe='')}"
+        item = self.call("GET", path, {"marketplaceIds": self.marketplace,
+                                       "includedData": "summaries,attributes"})
+        fa = item.get("attributes", {}).get("fulfillment_availability", [])
+        if not fa:
+            return {"status": "VALID", "issues": [], "info": "現在: 設定情報なし(標準のリードタイム)"}
+        parts = []
+        for x in fa:
+            lt = x.get("lead_time_to_ship_max_days")
+            parts.append(f"在庫 {x.get('quantity', '-')} / リードタイム "
+                         + (f"{lt}日" if lt is not None else "未設定(標準)"))
+        return {"status": "VALID", "issues": [], "info": "現在: " + "、".join(parts)}
+
+
 class DemoApi:
     """DEMO_MODE=1 のときに使うダミー。Amazonには一切接続しない。"""
     def fetch_mfn_skus(self, cancel):
         cancel.wait(2)
         return [f"DEMO-SKU-{n:04d}" for n in range(1, 61)]
+
+    def check_item(self, sku):
+        if sku.endswith("7"):
+            raise ApiError(404, "デモ用: SKUが見つかりません")
+        return {"status": "VALID", "issues": [], "info": "現在: 在庫 5 / リードタイム 2日"}
 
     def patch_lead_time(self, sku, days, preview):
         if sku.endswith("7"):
@@ -229,13 +248,13 @@ def prepare(test_sku):
 def update():
     days, dry = JOB["days"], JOB["dry_run"]
     ok = ng = 0
-    failures = []
+    failures, samples = [], []
     try:
         for n, sku in enumerate(list(SKUS), 1):
             if CANCEL.is_set():
                 raise Cancelled()
             try:
-                res = API.patch_lead_time(sku, days, dry)
+                res = API.check_item(sku) if dry else API.patch_lead_time(sku, days)
                 status = res.get("status", "?")
                 issues = " / ".join(f"[{i.get('severity')}] {i.get('message')}"
                                     for i in res.get("issues", []))
@@ -245,10 +264,14 @@ def update():
                 status, issues = f"HTTP{e.status}", e.body[:300]
             good = status in ("ACCEPTED", "VALID")
             ok, ng = ok + good, ng + (not good)
+            if dry and good:
+                issues = res.get("info", "")
+                if len(samples) < 5:
+                    samples.append({"sku": sku, "info": issues})
             RESULTS.append((sku, days, status, issues))
             if not good and len(failures) < 200:
                 failures.append({"sku": sku, "status": status, "issues": issues[:300]})
-            set_job(done=n, ok=ok, ng=ng, failures=failures)
+            set_job(done=n, ok=ok, ng=ng, failures=failures, samples=samples)
             CANCEL.wait(INTERVAL)
         set_job(phase="done", finished=time.time())
     except Cancelled:
@@ -263,7 +286,7 @@ def start(days, dry_run, test_sku):
             return False
         JOB.clear()
         JOB.update(phase="report", days=days, dry_run=dry_run, test_sku=test_sku,
-                   total=0, done=0, ok=0, ng=0, failures=[], message="")
+                   total=0, done=0, ok=0, ng=0, failures=[], samples=[], message="")
         SKUS.clear()
         RESULTS.clear()
         CANCEL.clear()
@@ -478,7 +501,7 @@ PAGE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
  <div class="field"><label for="sku">1商品だけで試す(任意)</label>
   <input id="sku" type="text" placeholder="SKUを入力" autocomplete="off">
   <p class="hint">入力すると、そのSKUだけを更新します。空欄なら全商品が対象です。</p></div>
- <label class="check"><input id="dry" type="checkbox"><span>検証のみ行う(Amazonには反映しません)</span></label>
+ <label class="check"><input id="dry" type="checkbox"><span>確認のみ行う(現在の設定を読み取るだけで、変更しません)</span></label>
  <div class="row"><button class="primary" id="go" type="submit">対象の商品を確認する</button></div>
  <p class="err" id="formerr" role="alert"></p>
 </form>
@@ -492,6 +515,7 @@ PAGE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <button class="ghost" id="cancel" hidden>中止する</button>
   <a id="csv" href="/api/result.csv" hidden>結果をCSVでダウンロード</a>
  </div>
+ <div id="samples" class="nums" hidden style="margin-top:12px;word-break:break-all"></div>
  <div id="fails" hidden><table><thead><tr><th>SKU</th><th>結果</th><th>内容</th></tr></thead><tbody id="rows"></tbody></table></div>
 </div>
 </main><script>
@@ -509,7 +533,7 @@ function render(s){
   $('go').disabled=busy; $('days').disabled=busy; $('sku').disabled=busy; $('dry').disabled=busy;
   $('panel').hidden=p==='idle';
   if(p==='idle')return;
-  const what=s.dry_run?'検証':'更新';
+  const what=s.dry_run?'確認':'更新';
   const t={report:'対象の商品を調べています…',
     confirm:`出品者出荷 ${s.total} 件を ${s.days} 日に${what}します`,
     updating:`${what}しています…`,
@@ -517,17 +541,20 @@ function render(s){
   $('title').textContent=t; $('title').className='big'+(p==='error'?' err':'');
   let m=s.message||'';
   if(p==='report')m='Amazonから出品レポートを取得しています。数分かかることがあります。';
-  if(p==='confirm')m=s.dry_run?'Amazonに内容を検証させるだけで、設定は変わりません。':'実行するとAmazonの設定が変わります。';
-  if(p==='done')m=s.dry_run?'検証のみのため、Amazonの設定は変わっていません。':'Amazon側への反映には数分〜15分ほどかかります。';
+  if(p==='confirm')m=s.dry_run?'各商品の現在の設定を読み取るだけで、Amazonの設定は変わりません。':'実行するとAmazonの設定が変わります。';
+  if(p==='done')m=s.dry_run?'確認のみのため、Amazonの設定は変わっていません。':'Amazon側への反映には数分〜15分ほどかかります。';
   $('msg').textContent=m;
   const prog=['updating','done','cancelled','error'].includes(p)&&s.total>0&&s.done>0||p==='updating';
   $('bar').hidden=!prog;
   $('fill').style.width=(s.total?Math.round(s.done/s.total*100):0)+'%';
   $('nums').textContent=prog?`${s.done} / ${s.total} 件  ・  成功 ${s.ok}  ・  失敗 ${s.ng}`:'';
   $('confirm').hidden=p!=='confirm';
-  $('confirm').textContent=s.dry_run?`${s.total} 件を検証する`:`${s.total} 件を ${s.days} 日に更新する`;
+  $('confirm').textContent=s.dry_run?`${s.total} 件を確認する`:`${s.total} 件を ${s.days} 日に更新する`;
   $('cancel').hidden=!busy;
   $('csv').hidden=!(s.done>0&&!busy);
+  const sm=s.samples||[]; $('samples').hidden=!sm.length;
+  const sl=$('samples'); sl.textContent='';
+  for(const x of sm){const d=document.createElement('div');d.textContent=x.sku+'  —  '+x.info;sl.appendChild(d)}
   const f=s.failures||[]; $('fails').hidden=!f.length;
   const rows=$('rows'); rows.textContent='';
   for(const x of f){const tr=document.createElement('tr');
